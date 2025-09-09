@@ -6,50 +6,86 @@ import time
 import os
 
 
-@st.cache_data
-def download_similarity_file():
-    """Download the similarity.pkl file from Google Drive if it doesn't exist"""
+def download_large_file_from_google_drive(file_id, destination):
+    """Download a large file from Google Drive"""
 
-    # Direct download link for your similarity.pkl file
-    SIMILARITY_URL = "https://drive.google.com/uc?export=download&id=1JOeVuqgULOdCAu2JmMtMogYlUEiMLZCg"
+    def get_confirm_token(response):
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                return value
+        return None
+
+    def save_response_content(response, destination, chunk_size=32768):
+        total_size = int(response.headers.get('content-length', 0))
+        progress_bar = st.progress(0)
+
+        with open(destination, "wb") as f:
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress = downloaded / total_size
+                        progress_bar.progress(progress)
+        progress_bar.empty()
+
+    URL = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+
+    response = session.get(URL, params={'id': file_id}, stream=True)
+    token = get_confirm_token(response)
+
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, stream=True)
+
+    save_response_content(response, destination)
+
+
+@st.cache_data
+def load_similarity_data():
+    """Load similarity data, downloading from Google Drive if necessary"""
+
+    file_id = "1JOeVuqgULOdCAu2JmMtMogYlUEiMLZCg"
 
     if not os.path.exists('similarity.pkl'):
-        st.info("📥 Downloading similarity data (this may take a moment)...")
+        st.info("📥 Downloading similarity data from Google Drive (this may take a moment)...")
 
         try:
-            response = requests.get(SIMILARITY_URL, stream=True)
-            response.raise_for_status()
+            download_large_file_from_google_drive(file_id, 'similarity.pkl')
 
-            total_size = int(response.headers.get('content-length', 0))
-            progress_bar = st.progress(0)
-
-            with open('similarity.pkl', 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            progress = downloaded / total_size
-                            progress_bar.progress(progress)
-
-            progress_bar.empty()
-            st.success("✅ Similarity data downloaded successfully!")
-            return True
+            # Verify the file was downloaded correctly
+            try:
+                with open('similarity.pkl', 'rb') as f:
+                    test_load = pickle.load(f)
+                st.success("✅ Similarity data downloaded and verified successfully!")
+            except Exception as verify_error:
+                st.error(f"❌ Downloaded file is corrupted: {str(verify_error)}")
+                if os.path.exists('similarity.pkl'):
+                    os.remove('similarity.pkl')
+                return None
 
         except Exception as e:
             st.error(f"❌ Failed to download similarity data: {str(e)}")
-            st.error("Please check if the Google Drive link is correct and publicly accessible.")
-            return False
+            st.error("Please try refreshing the page or contact support.")
+            return None
 
-    return True
+    # Load the similarity matrix
+    try:
+        with open('similarity.pkl', 'rb') as f:
+            similarity = pickle.load(f)
+        return similarity
+    except Exception as e:
+        st.error(f"❌ Error loading similarity data: {str(e)}")
+        if os.path.exists('similarity.pkl'):
+            os.remove('similarity.pkl')
+        return None
 
 
 def fetch_poster(movie_id):
     try:
-        # Add a small delay to prevent rate limiting
         time.sleep(0.1)
-
         url = f'https://api.themoviedb.org/3/movie/{movie_id}?api_key=8265bd1679663a7ea12ac168da84d2e8&language=en-US'
         response = requests.get(url, timeout=10)
 
@@ -58,16 +94,14 @@ def fetch_poster(movie_id):
             if 'poster_path' in data and data['poster_path']:
                 return "https://image.tmdb.org/t/p/w500/" + data['poster_path']
 
-        # Return placeholder if no poster found
         return "https://via.placeholder.com/500x750?text=No+Poster"
 
     except Exception as e:
-        # Silently handle the error - don't show warning to user
         print(f"Could not fetch poster for movie ID {movie_id}: {str(e)}")
         return "https://via.placeholder.com/500x750?text=No+Poster"
 
 
-def recommend(movie):
+def recommend(movie, movies, similarity):
     try:
         movie_index = movies[movies['title'] == movie].index[0]
         distances = similarity[movie_index]
@@ -83,13 +117,11 @@ def recommend(movie):
 
             recommended_movies.append(movie_title)
 
-            # Fetch poster with error handling
             poster_url = fetch_poster(movie_id)
             if "placeholder" in poster_url:
                 failed_posters += 1
             recommended_movies_posters.append(poster_url)
 
-        # Show summary if some posters failed
         if failed_posters > 0:
             st.info(f"ℹ️ {failed_posters} out of 5 movie posters could not be loaded (using placeholders)")
 
@@ -110,42 +142,38 @@ st.set_page_config(
 st.title("🎬 Movie Recommender System")
 st.write("Select a movie and get personalized recommendations with posters!")
 
-# Download similarity file if needed
-if not download_similarity_file():
-    st.stop()
-
-# Load Data
+# Load movies data (should be in the repository)
 try:
-    # Load movies (should be small enough for GitHub)
     movies_dict = pickle.load(open('movies.pkl', 'rb'))
     movies = pd.DataFrame(movies_dict)
-
-    # Load similarity matrix (downloaded from Google Drive)
-    with st.spinner("Loading similarity data..."):
-        similarity = pickle.load(open('similarity.pkl', 'rb'))
-
-except FileNotFoundError as e:
-    st.error(f"❌ Required files not found: {str(e)}")
-    st.error("Please make sure movies.pkl is uploaded to the repository.")
+except FileNotFoundError:
+    st.error("❌ movies.pkl not found. Please make sure it's uploaded to your repository.")
     st.stop()
 except Exception as e:
-    st.error(f"❌ Error loading data: {str(e)}")
+    st.error(f"❌ Error loading movies data: {str(e)}")
     st.stop()
 
+# Load similarity data (download from Google Drive if needed)
+with st.spinner("Loading similarity data..."):
+    similarity = load_similarity_data()
+
+if similarity is None:
+    st.error("❌ Could not load similarity data. Please try refreshing the page.")
+    st.stop()
+
+# Main app interface
 selected_movie_name = st.selectbox(
     "Please Select a Movie:",
     movies['title'].values
 )
 
-# Recommendation Button
 if st.button('🎯 Get Recommendations'):
     with st.spinner('Finding similar movies and fetching posters...'):
-        names, posters = recommend(selected_movie_name)
+        names, posters = recommend(selected_movie_name, movies, similarity)
 
     if names and posters and len(names) == 5:
         st.success(f"Movies similar to '{selected_movie_name}':")
 
-        # Use st.columns instead of st.beta_columns
         col1, col2, col3, col4, col5 = st.columns(5)
 
         with col1:
